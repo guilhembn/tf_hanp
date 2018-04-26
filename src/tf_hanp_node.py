@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # license removed for brevity
+import math
 import rospy
 from geometry_msgs.msg import PoseWithCovarianceStamped, TwistWithCovarianceStamped, Quaternion, AccelWithCovarianceStamped
 from hanp_msgs.msg import TrackedHumans, TrackedHuman, TrackedSegment, TrackedSegmentType
@@ -11,9 +12,11 @@ import humans
 
 HUMAN_PUB_TOPIC_NAME = "/tracked_humans"
 HUMAN_MARKER_PUB_TOPIC_NAME = "/tracked_humans_markers"
-REGEXP_HUMAN_FRAME = "(mocap_)?human-([0-9]+)"
+REGEXP_HUMAN_FRAME = "(mocap_)?human-([0-9]+)_footprint"
 
 MAP_FRAME = "map"
+
+EXPIRATION_DURATION = 5 # sec
 
 pub_humans = None
 pub_humans_markers = None
@@ -45,6 +48,10 @@ def fillSpeed(human):
     diffSpeed.twist.twist.angular.x = roll / dt
     diffSpeed.twist.twist.angular.y = pitch / dt
     diffSpeed.twist.twist.angular.z = yaw / dt
+    norm2d = math.hypot(diffSpeed.twist.twist.linear.x, diffSpeed.twist.twist.linear.y)
+    if norm2d >= 3.0:
+        diffSpeed.twist.twist.linear.x = diffSpeed.twist.twist.linear.x / norm2d * 3.0
+        diffSpeed.twist.twist.linear.y = diffSpeed.twist.twist.linear.y / norm2d * 3.0
     human.last_speed = human.current_speed
     human.current_speed = diffSpeed
 
@@ -61,6 +68,8 @@ def fillAcceleration(human):
 
 def parse_tf(time):
     global humans_dict, tf_sub
+    to_remove_ids = []
+    updated_ids = []
     for frame in tf_sub.getFrameStrings():
         match = human_frame_re.match(frame)
         if match is not None:
@@ -68,12 +77,19 @@ def parse_tf(time):
             is_mocap = match.group(1) is not None
             try:
                 position, orientation = tf_sub.lookupTransform(MAP_FRAME, frame, rospy.Time(0))
+                # print("hanp_tf : {}".format(tf.transformations.euler_from_quaternion(orientation)))
+                last_time = tf_sub.getLatestCommonTime(frame, MAP_FRAME)
+                if rospy.Time.now() - last_time >= rospy.Duration(EXPIRATION_DURATION):
+                    to_remove_ids.append(id)
+                    continue
             except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
                 continue
             if id not in humans_dict:
                 humans_dict[id] = humans.Human()
-            if not is_mocap:
-                orientation = tf.transformations.quaternion_multiply(orientation, [0, 0.707, 0, 0.707])
+            # if is_mocap:
+            #     orientation = tf.transformations.quaternion_multiply(orientation, [0, -0.707, 0, 0.707])
+            # else:
+            #     orientation = tf.transformations.quaternion_multiply(orientation, [0, -0.707, 0, 0.707])
             humans_dict[id].last_pose = humans_dict[id].current_pose
             h_pose = PoseWithCovarianceStamped()
             h_pose.header.frame_id = MAP_FRAME
@@ -85,6 +101,10 @@ def parse_tf(time):
                 fillSpeed(humans_dict[id])
             if humans_dict[id].last_speed is not None:
                 fillAcceleration(humans_dict[id])
+            updated_ids.append(id)
+    for i in (set(humans_dict.keys()) - set(updated_ids)).union(set(to_remove_ids)):
+        if i in humans_dict:
+            del humans_dict[i]
     if len(humans_dict) != 0:
         send_hanp()
 
